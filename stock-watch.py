@@ -65,6 +65,9 @@ def get_finnhub_prices(ticker, start, end):
 # -----------------------------
 # AI SENTIMENT
 # -----------------------------
+from openai import OpenAI
+client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
+
 def classify_sentiment(metric_name, value):
     """Use OpenAI to classify positive/neutral/negative."""
     prompt = (
@@ -74,15 +77,15 @@ def classify_sentiment(metric_name, value):
         "Respond with only one word."
     )
 
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2,
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
         temperature=0
     )
 
-    return response["choices"][0]["message"]["content"].strip()
-
+    return response.choices[0].message.content.strip()
 
 # -----------------------------
 # PRICE REACTION
@@ -195,3 +198,4 @@ if st.button("Run Analysis"):
     ax.legend()
     plt.xticks(rotation=45)
     st.pyplot(fig)
+
