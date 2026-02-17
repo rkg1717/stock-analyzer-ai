@@ -1,201 +1,252 @@
 import streamlit as st
 import requests
 import pandas as pd
-import datetime as dt
-import matplotlib.pyplot as plt
-import openai
+import plotly.express as px
+from openai import OpenAI
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-FINNHUB_KEY = st.secrets["FINNHUB_KEY"] 
-ALPHA_KEY = st.secrets["ALPHA_KEY"] 
+# =========================
+# Config & clients
+# =========================
+st.set_page_config(page_title="Quarterly Report Analyzer", layout="wide")
+
+ALPHA_KEY = st.secrets["ALPHA_KEY"]
 OPENAI_KEY = st.secrets["OPENAI_KEY"]
 
-openai.api_key = OPENAI_KEY
+client = OpenAI(api_key=OPENAI_KEY)
 
-# -----------------------------
-# DATA HELPERS
-# -----------------------------
-def get_alpha_fundamentals(ticker):
-    """Pull quarterly fundamentals from Alpha Vantage."""
-    url = (
-        f"https://www.alphavantage.co/query?"
-        f"function=OVERVIEW&symbol={ticker}&apikey={ALPHA_KEY}"
-    )
-    data = requests.get(url).json()
-    return data
+ALPHA_BASE = "https://www.alphavantage.co/query"
 
 
-def get_alpha_quarterly_reports(ticker):
-    """Alpha Vantage quarterly earnings."""
-    url = (
-        f"https://www.alphavantage.co/query?"
-        f"function=EARNINGS&symbol={ticker}&apikey={ALPHA_KEY}"
-    )
-    data = requests.get(url).json()
+# =========================
+# Data fetchers
+# =========================
+@st.cache_data(show_spinner=False)
+def fetch_quarterly_earnings(symbol: str) -> pd.DataFrame:
+    params = {
+        "function": "EARNINGS",
+        "symbol": symbol,
+        "apikey": ALPHA_KEY,
+    }
+    r = requests.get(ALPHA_BASE, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
     if "quarterlyEarnings" not in data:
         return pd.DataFrame()
+
     df = pd.DataFrame(data["quarterlyEarnings"])
-    df["reportedDate"] = pd.to_datetime(df["reportedDate"])
-    return df
+    # Normalize types
+    df["reportedDate"] = pd.to_datetime(df["reportedDate"], errors="coerce")
+    for col in ["reportedEPS", "estimatedEPS", "surprise", "surprisePercentage"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("reportedDate")
 
 
-def get_finnhub_prices(ticker, start, end):
-    """Daily prices from Finnhub."""
-    url = "https://finnhub.io/api/v1/stock/candle"
+@st.cache_data(show_spinner=False)
+def fetch_overview(symbol: str) -> pd.DataFrame:
     params = {
-        "symbol": ticker,
-        "resolution": "D",
-        "from": int(start.timestamp()),
-        "to": int(end.timestamp()),
-        "token": FINNHUB_KEY
+        "function": "OVERVIEW",
+        "symbol": symbol,
+        "apikey": ALPHA_KEY,
     }
-    data = requests.get(url, params=params).json()
-    if data.get("s") != "ok":
+    r = requests.get(ALPHA_BASE, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if not data or "Symbol" not in data:
         return pd.DataFrame()
-    df = pd.DataFrame({
-        "t": pd.to_datetime(data["t"], unit="s"),
-        "c": data["c"]
-    })
-    df.rename(columns={"t": "date", "c": "close"}, inplace=True)
+
+    # Pick a subset of useful fundamentals
+    fields = [
+        "Symbol",
+        "Name",
+        "Sector",
+        "MarketCapitalization",
+        "PERatio",
+        "PEGRatio",
+        "EPS",
+        "ReturnOnEquityTTM",
+        "ProfitMargin",
+        "OperatingMarginTTM",
+        "CurrentRatio",
+        "QuickRatio",
+        "DebtToEquity",
+    ]
+    row = {k: data.get(k, None) for k in fields}
+    df = pd.DataFrame([row])
+    # Convert numeric fields
+    numeric_cols = [
+        "MarketCapitalization",
+        "PERatio",
+        "PEGRatio",
+        "EPS",
+        "ReturnOnEquityTTM",
+        "ProfitMargin",
+        "OperatingMarginTTM",
+        "CurrentRatio",
+        "QuickRatio",
+        "DebtToEquity",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
-# -----------------------------
-# AI SENTIMENT
-# -----------------------------
-from openai import OpenAI
-client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
-
-def classify_sentiment(metric_name, value):
-    """Use OpenAI to classify positive/neutral/negative."""
+# =========================
+# AI sentiment
+# =========================
+def classify_sentiment(metric_name: str, value) -> str:
     prompt = (
+        f"You are an equity analyst.\n"
         f"Metric: {metric_name}\n"
-        f"Value: {value}\n"
-        "Classify as positive, neutral, or negative for investors. "
-        "Respond with only one word."
+        f"Value: {value}\n\n"
+        "Classify this as positive, neutral, or negative for long-term investors. "
+        "Respond with exactly one word: Positive, Neutral, or Negative."
     )
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-
-    return response.choices[0].message.content.strip()
-
-# -----------------------------
-# PRICE REACTION
-# -----------------------------
-def compute_price_reaction(price_df, report_date):
-    """Compute % change after 1,3,10,30 days."""
-    horizons = [1, 3, 10, 30]
-    out = {}
-
-    for h in horizons:
-        target = report_date + dt.timedelta(days=h)
-        future = price_df[price_df["date"] >= target].head(1)
-        base = price_df[price_df["date"] >= report_date].head(1)
-
-        if future.empty or base.empty:
-            out[f"{h}d"] = None
-        else:
-            out[f"{h}d"] = (future["close"].iloc[0] / base["close"].iloc[0] - 1) * 100
-
-    return out
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error: {e}"
 
 
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
+def build_sentiment_table(fund_df: pd.DataFrame) -> pd.DataFrame:
+    if fund_df.empty:
+        return pd.DataFrame()
+
+    metrics = {
+        "PE Ratio": fund_df["PERatio"].iloc[0],
+        "PEG Ratio": fund_df["PEGRatio"].iloc[0],
+        "EPS": fund_df["EPS"].iloc[0],
+        "ROE (TTM)": fund_df["ReturnOnEquityTTM"].iloc[0],
+        "Profit Margin": fund_df["ProfitMargin"].iloc[0],
+        "Operating Margin (TTM)": fund_df["OperatingMarginTTM"].iloc[0],
+        "Current Ratio": fund_df["CurrentRatio"].iloc[0],
+        "Quick Ratio": fund_df["QuickRatio"].iloc[0],
+        "Debt to Equity": fund_df["DebtToEquity"].iloc[0],
+    }
+
+    rows = []
+    for name, val in metrics.items():
+        if pd.isna(val):
+            continue
+        sentiment = classify_sentiment(name, val)
+        rows.append({"Metric": name, "Value": val, "AI Sentiment": sentiment})
+
+    return pd.DataFrame(rows)
+
+
+# =========================
+# UI
+# =========================
 st.title("Quarterly Report Analyzer with AI Sentiment")
 
-ticker = st.text_input("Ticker", "AAPL").upper()
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
-    start_date = st.date_input("Start date", dt.date(2020, 1, 1))
+    ticker = st.text_input("Ticker", "AAPL").upper().strip()
 with col2:
-    end_date = st.date_input("End date", dt.date.today())
+    start_date = st.date_input("Start date", pd.to_datetime("2020-01-01"))
+with col3:
+    end_date = st.date_input("End date", pd.to_datetime("today"))
 
-if st.button("Run Analysis"):
-    st.write("### Fetching quarterly reports…")
-    earnings = get_alpha_quarterly_reports(ticker)
+run = st.button("Run Analysis")
 
-    if earnings.empty:
-        st.error("No quarterly earnings found.")
+if run:
+    if not ticker:
+        st.error("Please enter a ticker.")
         st.stop()
 
-    earnings = earnings[
-        (earnings["reportedDate"].dt.date >= start_date) &
-        (earnings["reportedDate"].dt.date <= end_date)
-    ]
+    st.subheader(f"Fetching data for {ticker}…")
 
-    if earnings.empty:
-        st.warning("No reports in this date range.")
-        st.stop()
+    # ---- Fetch data ----
+    with st.spinner("Fetching quarterly earnings…"):
+        earnings_df = fetch_quarterly_earnings(ticker)
 
-    st.write("### Fetching fundamentals…")
-    fundamentals = get_alpha_fundamentals(ticker)
+    with st.spinner("Fetching fundamentals…"):
+        overview_df = fetch_overview(ticker)
 
-    # Extract metrics
-    metrics = {
-        "ROE": fundamentals.get("ReturnOnEquityTTM"),
-        "OCF": fundamentals.get("OperatingCashFlowTTM"),
-        "Quick Ratio": fundamentals.get("QuickRatio"),
-        "EBIT": fundamentals.get("EBITDA"),  # Alpha Vantage uses EBITDA
-        "Revenue Growth": fundamentals.get("QuarterlyRevenueGrowthYOY"),
-        "P/B": fundamentals.get("PriceToBookRatio"),
-        "PEG": fundamentals.get("PEGRatio")
-    }
+    # ---- Fundamentals section ----
+    st.markdown("## Fundamentals snapshot")
 
-    # AI sentiment
-    st.write("### AI Sentiment Classification")
-    sentiment_results = {}
-    for k, v in metrics.items():
-        sentiment_results[k] = classify_sentiment(k, v)
+    if overview_df.empty:
+        st.warning("No fundamentals found for this ticker.")
+    else:
+        info_cols = st.columns([2, 1, 1])
+        with info_cols[0]:
+            st.write(
+                f"**{overview_df['Name'].iloc[0]}**  "
+                f"({overview_df['Symbol'].iloc[0]})"
+            )
+            st.write(f"Sector: {overview_df['Sector'].iloc[0]}")
+        with info_cols[1]:
+            mc = overview_df["MarketCapitalization"].iloc[0]
+            if pd.notna(mc):
+                st.metric("Market Cap", f"${mc:,.0f}")
+        with info_cols[2]:
+            pe = overview_df["PERatio"].iloc[0]
+            if pd.notna(pe):
+                st.metric("P/E Ratio", f"{pe:.2f}")
 
-    sentiment_df = pd.DataFrame({
-        "Metric": list(metrics.keys()),
-        "Value": list(metrics.values()),
-        "Sentiment": list(sentiment_results.values())
-    })
+        st.dataframe(
+            overview_df.set_index("Symbol").T,
+            use_container_width=True,
+        )
 
-    st.dataframe(sentiment_df)
+        st.markdown("### AI sentiment on key metrics")
+        sent_df = build_sentiment_table(overview_df)
+        if not sent_df.empty:
+            st.dataframe(sent_df, use_container_width=True)
+        else:
+            st.info("Not enough numeric fundamentals to run sentiment.")
 
-    # Price reaction
-    st.write("### Price Reaction After Reports")
-    all_reactions = []
+    # ---- Earnings section ----
+    st.markdown("## Quarterly earnings")
 
-    # Pull price data once
-    price_df = get_finnhub_prices(
-        ticker,
-        dt.datetime.combine(start_date, dt.time()),
-        dt.datetime.combine(end_date + dt.timedelta(days=40), dt.time())
-    )
+    if earnings_df.empty:
+        st.warning("No quarterly earnings found.")
+    else:
+        # Filter by date range
+        mask = (earnings_df["reportedDate"] >= pd.to_datetime(start_date)) & (
+            earnings_df["reportedDate"] <= pd.to_datetime(end_date)
+        )
+        filtered = earnings_df[mask]
 
-    for _, row in earnings.iterrows():
-        report_date = row["reportedDate"].date()
-        reaction = compute_price_reaction(price_df, row["reportedDate"])
-        reaction["report_date"] = report_date
-        all_reactions.append(reaction)
+        if filtered.empty:
+            st.warning("No quarterly earnings in the selected date range.")
+        else:
+            st.dataframe(filtered, use_container_width=True)
 
-    reaction_df = pd.DataFrame(all_reactions)
-    st.dataframe(reaction_df)
+            # EPS over time
+            st.markdown("### Reported vs Estimated EPS")
+            eps_fig = px.line(
+                filtered,
+                x="reportedDate",
+                y=["reportedEPS", "estimatedEPS"],
+                markers=True,
+                labels={"value": "EPS", "reportedDate": "Reported Date", "variable": "Series"},
+                title=f"{ticker} EPS History",
+            )
+            st.plotly_chart(eps_fig, use_container_width=True)
 
-    # Plot
-    st.write("### Price Reaction Chart")
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for h in ["1d", "3d", "10d", "30d"]:
-        if h in reaction_df.columns:
-            ax.plot(reaction_df["report_date"], reaction_df[h], marker="o", label=h)
+            # Surprise percentage
+            if filtered["surprisePercentage"].notna().any():
+                st.markdown("### Earnings surprise (%)")
+                sp_fig = px.bar(
+                    filtered,
+                    x="reportedDate",
+                    y="surprisePercentage",
+                    labels={
+                        "reportedDate": "Reported Date",
+                        "surprisePercentage": "Surprise (%)",
+                    },
+                    title=f"{ticker} Earnings Surprise Percentage",
+                )
+                st.plotly_chart(sp_fig, use_container_width=True)
 
-    ax.axhline(0, color="gray")
-    ax.set_ylabel("% change")
-    ax.set_title(f"{ticker} Price Reaction After Earnings")
-    ax.legend()
-    plt.xticks(rotation=45)
-    st.pyplot(fig)
-
+    st.success("Analysis complete.")
+else:
+    st.info("Enter a ticker and click **Run Analysis** to begin.")
