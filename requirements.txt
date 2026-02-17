@@ -2,4 +2,4 @@ streamlit
 pandas
 requests
 openai
-matplotlib
+plotly
